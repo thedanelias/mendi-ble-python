@@ -195,47 +195,28 @@ class MendiStream:
             self._sample_queue.put_nowait(sample)
             logger.debug(f"FC3EABB4: {sample.raw_value} (activity: {sample.activity_level})")
     
-    async def _trigger_loop(self) -> None:
-        """Background task to trigger data via descriptor writes."""
-        while self._streaming and self._connected:
-            try:
-                # Write to CCCD descriptor to trigger data
-                if self.client and self.client.is_connected:
-                    await self.client.write_gatt_descriptor(
-                        self.CCCD_HANDLE,
-                        self.CCCD_ENABLE
-                    )
-                    logger.debug("Triggered data request via descriptor")
-                
-                # Wait before next trigger
-                await asyncio.sleep(self.TRIGGER_INTERVAL)
-                
-            except Exception as e:
-                logger.error(f"Trigger loop error: {e}")
-                if self.auto_reconnect:
-                    await self._handle_disconnect()
-                break
-    
+
+
     async def _handle_disconnect(self) -> None:
         """Handle device disconnection with enhanced retry logic."""
         self._connected = False
         self._streaming = False
-        
+
         # Cancel tasks
         if self._trigger_task:
             self._trigger_task.cancel()
             self._trigger_task = None
-        
+
         if self._watchdog_task:
             self._watchdog_task.cancel()
             self._watchdog_task = None
-        
+
         logger.warning("Device disconnected")
-        
+
         if self.auto_reconnect:
             logger.info("Attempting automatic reconnection...")
             success = await self._reconnect_with_retry()
-            
+
             if success:
                 try:
                     await self.start_streaming()
@@ -250,44 +231,44 @@ class MendiStream:
                     f"Failed to reconnect after {self.reconnect_attempts} attempts. "
                     f"Last error: {self._last_error}"
                 )
-    
+
     async def _reconnect_with_retry(self, max_attempts: int = None) -> bool:
         """Enhanced reconnection with exponential backoff and phantom connection handling.
-        
+
         Args:
             max_attempts: Override default max attempts
-            
+
         Returns:
             True if reconnection successful, False otherwise
         """
         max_attempts = max_attempts or self.reconnect_attempts
         start_time = time.time()
-        
+
         for attempt in range(max_attempts):
             # Check timeout
             if time.time() - start_time > self.reconnect_timeout:
                 logger.error(f"Reconnection timeout after {self.reconnect_timeout}s")
                 break
-                
+
             try:
                 # Update state
                 self._connection_state = ConnectionState.RECONNECTING
                 self._reconnect_count = attempt + 1
-                
+
                 # Try direct reconnection
                 logger.info(f"Reconnection attempt {attempt + 1}/{max_attempts} to {self.device_address}")
                 await self.connect(self.device_address)
-                
+
                 # Success
                 self._connection_state = ConnectionState.CONNECTED
                 self._reconnect_count = 0
                 self._last_error = None
                 logger.info("Reconnection successful")
                 return True
-                
+
             except Exception as e:
                 self._last_error = str(e)
-                
+
                 # Check for phantom connection
                 if "not found" in str(e).lower() or "could not find" in str(e).lower():
                     if attempt == 0:
@@ -296,18 +277,18 @@ class MendiStream:
                             f"Device {self.device_address} not advertising. "
                             "Possible phantom connection - device may still think it's connected."
                         )
-                
+
                 # Calculate exponential backoff
                 wait_time = min(2 ** attempt, 30)
                 logger.info(f"Reconnection failed: {e}")
                 logger.info(f"Waiting {wait_time}s before retry...")
                 await asyncio.sleep(wait_time)
-                
+
                 # After 2 failures, try scanning for any Mendi device
                 if attempt >= 2 and self.force_scan_on_failure:
                     logger.info("Attempting to find any available Mendi device...")
                     devices = await self._scan_for_mendi_devices(timeout=5)
-                    
+
                     if devices:
                         # Try the device with strongest signal
                         old_address = self.device_address
@@ -318,48 +299,74 @@ class MendiStream:
                         )
                     else:
                         logger.warning("No Mendi devices found during scan")
-        
+
         # All attempts failed
         self._connection_state = ConnectionState.FAILED
         logger.error(f"All reconnection attempts exhausted. Last error: {self._last_error}")
         return False
-    
+
+    async def _trigger_loop(self) -> None:
+        """Background task to trigger data via descriptor writes."""
+        while self._streaming and self._connected:
+            try:
+                if not self.client or not self.client.is_connected:
+                    break
+
+                await self.client.stop_notify(self.FC3EABB5_UUID)
+                await asyncio.sleep(0.1)
+
+                await self.client.start_notify(
+                    self.FC3EABB5_UUID,
+                    self._handle_fc3eabb5_notification
+                )
+
+                await asyncio.sleep(self.TRIGGER_INTERVAL)
+
+            except asyncio.CancelledError:
+                break
+
+            except Exception as e:
+                logger.error(f"Trigger loop error: {e}")
+                if self.auto_reconnect:
+                    await self._handle_disconnect()
+                break
+
     async def _scan_for_mendi_devices(self, timeout: float = 5.0) -> List:
         """Scan for available Mendi devices.
-        
+
         Args:
             timeout: Scan timeout in seconds
-            
+
         Returns:
             List of found devices sorted by signal strength
         """
         from .scanner import MendiScanner
-        
+
         logger.debug(f"Scanning for Mendi devices for {timeout}s...")
         scanner = MendiScanner(timeout=timeout)
         devices = await scanner.scan_all()
-        
+
         if devices:
             logger.info(f"Found {len(devices)} Mendi device(s):")
             for device in devices:
                 rssi = getattr(device, 'rssi', -100)
                 logger.info(f"  {device.address}: RSSI {rssi} dBm")
-        
+
         return devices
-    
+
     async def _force_disconnect(self) -> None:
         """Force disconnection on both client and device side."""
         logger.debug("Forcing disconnection...")
-        
+
         # Cancel tasks first
         if self._trigger_task:
             self._trigger_task.cancel()
             self._trigger_task = None
-            
+
         if self._watchdog_task:
             self._watchdog_task.cancel()
             self._watchdog_task = None
-        
+
         # Try to disconnect cleanly
         try:
             if self.client:
@@ -368,30 +375,30 @@ class MendiStream:
                     logger.debug("Client disconnected")
         except Exception as e:
             logger.debug(f"Force disconnect error (often expected): {e}")
-        
+
         # Clear state
         self._connected = False
         self._streaming = False
         self._connection_state = ConnectionState.DISCONNECTED
         self.client = None
-    
+
     async def _connection_watchdog(self) -> None:
         """Monitor connection health based on data flow."""
         logger.debug("Connection watchdog started")
-        
+
         while self._connected and self._streaming and self.watchdog_enabled:
             try:
                 await asyncio.sleep(5)  # Check every 5 seconds
-                
+
                 if self._last_data_time:
                     time_since_data = time.time() - self._last_data_time
-                    
+
                     if time_since_data > self.connection_timeout:
                         logger.warning(
                             f"No data received for {time_since_data:.1f}s "
                             f"(timeout: {self.connection_timeout}s)"
                         )
-                        
+
                         # Connection likely lost
                         logger.info("Watchdog triggering reconnection...")
                         await self._force_disconnect()
@@ -403,20 +410,20 @@ class MendiStream:
                             f"No data for {time_since_data:.1f}s, "
                             "approaching timeout"
                         )
-                        
+
             except asyncio.CancelledError:
                 logger.debug("Watchdog cancelled")
                 break
             except Exception as e:
                 logger.error(f"Watchdog error: {e}")
                 break
-        
+
         logger.debug("Connection watchdog stopped")
-    
+
     @property
     def connection_status(self) -> dict:
         """Get detailed connection status information.
-        
+
         Returns:
             Dictionary with connection state and metrics
         """
@@ -443,38 +450,38 @@ class MendiStream:
                 "watchdog_enabled": self.watchdog_enabled
             }
         }
-        
+
         # Calculate time since last data
         if self._last_data_time:
             status["seconds_since_data"] = round(time.time() - self._last_data_time, 1)
-        
+
         return status
-    
+
     async def start_streaming(self) -> None:
         """Start the streaming process with watchdog."""
         if not self._connected:
             await self.connect()
-        
+
         self._streaming = True
         self._last_data_time = time.time()  # Initialize data time
-        
+
         # Start trigger loop
         self._trigger_task = asyncio.create_task(self._trigger_loop())
-        
+
         # Start watchdog if enabled
         if self.watchdog_enabled:
             self._watchdog_task = asyncio.create_task(self._connection_watchdog())
             logger.debug("Watchdog enabled for connection monitoring")
-        
+
         logger.info("Streaming started")
-    
+
     async def stop_streaming(self) -> None:
         """Stop streaming and end session."""
         if not self._streaming:
             return  # Already stopped
-            
+
         self._streaming = False
-        
+
         # Cancel tasks
         if self._trigger_task:
             self._trigger_task.cancel()
@@ -483,7 +490,7 @@ class MendiStream:
             except asyncio.CancelledError:
                 pass
             self._trigger_task = None
-        
+
         if self._watchdog_task:
             self._watchdog_task.cancel()
             try:
@@ -491,23 +498,23 @@ class MendiStream:
             except asyncio.CancelledError:
                 pass
             self._watchdog_task = None
-        
+
         # End session only if it hasn't been ended
         if self.session.end_time is None:
             self.session.end_session()
-            
+
             if self.session_callback:
                 self.session_callback(self.session)
-            
+
             logger.info(f"Session ended. Points: {self.session.points}")
-    
+
     async def disconnect(self) -> None:
         """Disconnect from device."""
         if not self._connected and not self.client:
             return  # Already disconnected
-            
+
         await self.stop_streaming()
-        
+
         if self.client:
             try:
                 if self.client.is_connected:
@@ -516,31 +523,31 @@ class MendiStream:
                 logger.debug(f"Disconnect error (often expected): {e}")
             finally:
                 self.client = None
-        
+
         self._connected = False
         self._connection_state = ConnectionState.DISCONNECTED
         logger.info("Disconnected")
-    
+
     async def __aenter__(self):
         """Async context manager entry."""
         await self.connect()
         await self.start_streaming()
         return self
-    
+
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         """Async context manager exit."""
         await self.disconnect()
-    
+
     def __aiter__(self):
         """Make the stream iterable."""
         return self
-    
+
     async def __anext__(self) -> MendiSample:
         """Get next sample from the stream."""
         while True:  # Keep trying while auto_reconnect is enabled
             if not self._streaming:
                 raise StopAsyncIteration
-            
+
             try:
                 # Wait for sample with timeout
                 sample = await asyncio.wait_for(
@@ -562,6 +569,25 @@ class MendiStream:
                 # If auto_reconnect is False or streaming stopped, exit
                 raise StopAsyncIteration
 
+    async def debug_gatt(self):
+        if not self.client or not self.client.is_connected:
+            raise RuntimeError("Connect to Mendi first")
+
+        for service in self.client.services:
+            print(f"\nService: {service.uuid}")
+
+            for char in service.characteristics:
+                print(
+                    f"  Characteristic: {char.uuid}, "
+                    f"handle={char.handle}, "
+                    f"properties={char.properties}"
+                )
+
+                for desc in char.descriptors:
+                    print(
+                        f"    Descriptor: {desc.uuid}, "
+                        f"handle={desc.handle}"
+                    )
 
 @asynccontextmanager
 async def mendi_stream(device_address: Optional[str] = None) -> AsyncIterator[MendiStream]:
